@@ -69,7 +69,6 @@ security/sudo
 shells/bash
 shells/fish
 shells/zsh
-sysutils/bsdstats
 sysutils/catfish
 sysutils/ddrescue
 sysutils/dsbdriverd
@@ -80,6 +79,7 @@ sysutils/dunst
 filesystems/ext2
 filesystems/hfsfuse
 filesystems/sshfs
+filesystems/unionfs
 sysutils/powerdxx
 sysutils/sleuthkit
 sysutils/smartmontools

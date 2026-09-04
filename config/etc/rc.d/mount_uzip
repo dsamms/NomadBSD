@@ -36,6 +36,21 @@ start_cmd=do_mount_uzip
 stop_cmd=do_unmount
 : ${unionfs_maxfiles:=65536}
 
+#
+# The unionfs binary (filesystems/unionfs pkg, fuse3-based) and its
+# libfuse3 dependency live inside the uzip image. By the time the union
+# is mounted, the uzip is already available read-only under
+# /unionfs/usr/local, so run it from there with an explicit library
+# path (ldconfig has not been run at this point).
+#
+# NOTE: fuse3 removed the fuse2 options "nonempty" and "use_ino" -
+# do not add them back here. The mountpoint is always empty anyway
+# (a fresh directory created by the setup's commit step).
+#
+path_unionfs="/unionfs/usr/local/bin/unionfs"
+path_unionfs_libs="/unionfs/usr/local/lib"
+: ${mount_uzip_unionfs_opts:="cow,max_files=${unionfs_maxfiles},allow_other,suid,kernel_cache"}
+
 spinner_pid=-1
 
 is_zfs_root()
@@ -60,7 +75,7 @@ do_mount_uzip()
 		do_mount_unionfs
 		return
 	fi
-	if (! kldstat -q -m geom_uzip); then
+	if (! kldstat -q -m g_uzip && ! kldstat -q -n geom_uzip); then
 		kldload geom_uzip 2>/dev/null
 	fi
 	#
@@ -102,13 +117,18 @@ do_mount_unionfs()
 		fi
 		[ ! -d "${rwdir}" ] && mkdir -p "${rwdir}"
 	fi
-	kldstat -q -n fusefs && kldunload fusefs
-	if (! kldstat -q -n fusefs2 && ! kldstat -q -n fusefs); then
-		kldload fusefs2 2>/dev/null || kldload fusefs 2>/dev/null
+	if (! kldstat -q -n fusefs); then
+		kldload fusefs || \
+		    echo "${name}: failed to load fusefs.ko" >&2
 	fi
-	unionfs -o cow,max_files=${unionfs_maxfiles} \
-	        -o allow_other,use_ino,suid,nonempty,kernel_cache \
-	        "${rwdir}"=RW:/unionfs/usr/local=RO /usr/local
+	if [ ! -x "${path_unionfs}" ]; then
+		echo "${name}: ${path_unionfs} not found;" \
+		    "/usr/local will stay read-only" >&2
+		return
+	fi
+	LD_LIBRARY_PATH="${path_unionfs_libs}" "${path_unionfs}" \
+	    -o "${mount_uzip_unionfs_opts}" \
+	    "${rwdir}"=RW:/unionfs/usr/local=RO /usr/local
 	service ldconfig start
 }
 

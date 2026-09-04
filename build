@@ -106,7 +106,6 @@ BUILD_DEPENCIES_LIST_EOF
 )
 
 BUILD_STAGES=$(cat << BUILD_STAGES_END
-build_modules
 install_packages
 install_from_git_repos
 build_setupgui
@@ -117,7 +116,6 @@ build_dmconfig
 build_chusr
 build_lbi_gui
 install_nomadbsd_reset
-build_unionfs
 install_ports
 build_nvidia_drivers
 post_pkg_config
@@ -798,6 +796,14 @@ install_ports()
 
 build_kernel()
 {
+  # Respect BUILD_KERNEL here as well, not only in build_nomadbsd():
+  # resume_build() runs every stage after the failed one unconditionally,
+  # which would otherwise rebuild the custom kernel (and apply the src
+  # patches) on resume even with BUILD_KERNEL="NO".
+  case "${BUILD_KERNEL}" in
+  [yY][eE][sS]) ;;
+  *) return 0;;
+  esac
   local makeopts="KERNCONF=NOMADBSD ${BUILDKERNEL_OPTS}"
         makeopts="${makeopts} WITHOUT_MODULES=\"${WITHOUT_KMODS}\""
   local regx="/DEBUG=-g/d; /WITH_CTF=1/d; /^ident.*GENERIC/d;"
