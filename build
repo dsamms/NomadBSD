@@ -687,12 +687,20 @@ configure_networkmgr()
   # Remove Networkmgr's netcardmgr script which messes with our auto-
   # configured network interfaces in /etc/rc.conf.
   rm -f "${SYSDIR}"/usr/local/bin/netcardmgr
-  # Prevent execution of networkmgr's setup-nic script.
-  sed -i '' -E 's/^[::space::]*(.*action.*setup-nic.*)/#\1/g' \
-    "${SYSDIR}"/usr/local/etc/devd/networkmgr.conf
-  # Prevent execution of networkmgr's auto-switch script.
-  sed -i '' -E 's/^[::space::]*(.*action.*auto-switch.*)/#\1/g' \
-    "${SYSDIR}"/usr/local/etc/devd/networkmgr.conf
+  # Neutralize NetworkMgr's devd automation (setup-nic, link-up,
+  # auto-switch) entirely. The previous approach of sed-commenting the
+  # action lines left action-less "notify 5" rules behind; devd runs
+  # only the highest-priority rule matching an event, so such empty
+  # shells silently swallow events from lower-priority rules (e.g. the
+  # base system's notify-0 dhclient rules). NomadBSD handles interface
+  # configuration itself (dsbdriverd) and DHCP-on-link-up via
+  # /etc/devd/nomadbsd-dhclient.conf.
+  cat > "${SYSDIR}"/usr/local/etc/devd/networkmgr.conf << NETWORKMGR_CONF_END
+# NetworkMgr's devd rules are intentionally disabled on NomadBSD.
+# Interface setup is handled by dsbdriverd, and DHCP on link-up by
+# /etc/devd/nomadbsd-dhclient.conf. See configure_networkmgr() in the
+# NomadBSD build script.
+NETWORKMGR_CONF_END
 }
 
 configure_cupsd()
