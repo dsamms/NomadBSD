@@ -1,0 +1,454 @@
+#!/bin/sh
+#
+# Copyright (c) 2026, The NomadBSD Project
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# nomadbsd-dpi - Detect the DPI of the primary display via RandR/EDID and
+# apply a suitable UI scale for GTK (Xfce/xfconf) and Qt applications.
+#
+# Usage: nomadbsd-dpi <command>
+#
+#   detect   Print the detection result (DPI, scale decision) to stdout.
+#   env      Print "export VAR=..." lines for the chosen scale. Intended
+#            for eval'ing in xinitrc-style scripts *before* any Qt/GTK
+#            process is started.
+#   apply    Detect (honoring saved state and user override), write the
+#            env file, and apply xfconf/xrdb settings for the session.
+#   set x    Set a user override: "auto", "off", "1", "1.5", or "2".
+#            Takes effect on next login (or run "apply" afterwards).
+#   status   Show current state, override, and detection result.
+#
+# State (all per-user, under ${HOME}):
+#   ~/.config/nomadbsd/dpi.fingerprint  Hash of the connected-outputs set
+#                                       the last decision was made for.
+#   ~/.config/nomadbsd/dpi.override    "auto"|"off"|"1"|"1.5"|"2"
+#   ~/.config/nomadbsd/hidpi.env       Generated env fragment, sourced by
+#                                       the session xinitrc.
+#
+# Policy (X11: integer window scaling only; fractional = fonts-only):
+#   EDID missing/implausible  -> scale 1 (never scale on guesswork)
+#   dpi <  135                -> scale 1
+#   135 <= dpi < 170          -> scale 1 + Xft DPI 120 (dpi < 150) or
+#                                          Xft DPI 144 (dpi >= 150)
+#   dpi >= 170                -> scale 2
+#
+
+path_state_dir="${HOME}/.config/nomadbsd"
+path_fingerprint="${path_state_dir}/dpi.fingerprint"
+path_override="${path_state_dir}/dpi.override"
+path_env="${path_state_dir}/hidpi.env"
+
+# Boot menu toggle (see config/boot/lua/{core,menu}.lua)
+kenv_disable="initdpi.detect.disable"
+
+# Sanity limits for EDID physical width, in mm.
+edid_mm_min=50
+edid_mm_max=2000
+
+# DPI thresholds
+dpi_2x=170
+dpi_fonts=135
+dpi_fonts_hi=150
+
+# Cursor sizes per scale
+cursor_1x=24
+cursor_2x=48
+
+dpi_warn()
+{
+	echo "nomadbsd-dpi: $*" >&2
+}
+
+have_display()
+{
+	[ -n "${DISPLAY}" ] || return 1
+	command -v xrandr > /dev/null 2>&1 || return 1
+	xrandr -q > /dev/null 2>&1
+}
+
+#
+# Print one line per connected output:
+#   <name> <primary:1|0> <width_px> <height_px> <width_mm> <height_mm>
+# Geometry/physical size fields are 0 if not available.
+#
+connected_outputs()
+{
+	xrandr -q | awk '
+	/ connected/ {
+		name = $1
+		primary = / primary / ? 1 : 0
+		wpx = hpx = wmm = hmm = 0
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /^[0-9]+x[0-9]+\+[0-9-]+\+[0-9-]+$/) {
+				split($i, g, /[x+]/)
+				wpx = g[1]; hpx = g[2]
+			}
+		}
+		if (match($0, /[0-9]+mm x [0-9]+mm/)) {
+			s = substr($0, RSTART, RLENGTH)
+			gsub(/mm/, "", s)
+			split(s, m, / x /)
+			wmm = m[1]; hmm = m[2]
+		}
+		printf "%s %d %d %d %d %d\n", name, primary, wpx, hpx, wmm, hmm
+	}'
+}
+
+#
+# Choose the output that drives the global scale decision:
+# RandR primary > internal panel (eDP*/LVDS*/DSI*) > first connected.
+#
+pick_output()
+{
+	connected_outputs | awk '
+	{
+		if (!first)          { first = $0 }
+		if ($2 == 1 && !pri) { pri = $0 }
+		if ($1 ~ /^(eDP|LVDS|DSI)/ && !internal) { internal = $0 }
+	}
+	END {
+		if (pri != "")           print pri
+		else if (internal != "") print internal
+		else if (first != "")    print first
+	}'
+}
+
+#
+# Hash of the connected-outputs set. If this changes (dock/undock, new
+# monitor), a saved decision no longer applies and we re-detect.
+#
+calc_fingerprint()
+{
+	connected_outputs | md5 -q
+}
+
+#
+# Detection: sets globals dpi, scale, xft_dpi, out_name, edid_ok, reason.
+#
+detect()
+{
+	dpi=96; scale=1; xft_dpi=96; edid_ok=0; reason=""
+
+	set -- $(pick_output)
+	if [ $# -lt 6 ]; then
+		reason="no connected RandR outputs found"
+		out_name="none"
+		return 1
+	fi
+	out_name=$1; wpx=$3; wmm=$5
+
+	if [ "${wpx}" -eq 0 ]; then
+		reason="output ${out_name} reports no active mode"
+		return 1
+	fi
+	if [ "${wmm}" -lt ${edid_mm_min} ] || [ "${wmm}" -gt ${edid_mm_max} ]
+	then
+		# Projectors, KVMs, VMs, and the scfb/vesa fallback path all
+		# land here. Never scale on guesswork.
+		reason="implausible EDID width (${wmm}mm) on ${out_name}"
+		return 0
+	fi
+	edid_ok=1
+	dpi=$(( wpx * 254 / wmm / 10 ))
+
+	if [ ${dpi} -ge ${dpi_2x} ]; then
+		scale=2
+		xft_dpi=96
+		reason="${dpi} DPI on ${out_name} -> 2x integer scale"
+	elif [ ${dpi} -ge ${dpi_fonts} ]; then
+		scale=1
+		if [ ${dpi} -ge ${dpi_fonts_hi} ]; then
+			xft_dpi=144
+		else
+			xft_dpi=120
+		fi
+		reason="${dpi} DPI on ${out_name} -> fonts-only (Xft ${xft_dpi})"
+	else
+		scale=1
+		xft_dpi=96
+		reason="${dpi} DPI on ${out_name} -> no scaling"
+	fi
+	return 0
+}
+
+#
+# Map a user override string onto scale/xft_dpi. Returns 1 for "auto"
+# (meaning: use detection).
+#
+apply_override()
+{
+	case "$1" in
+	auto)	return 1 ;;
+	off|1)	scale=1; xft_dpi=96  ;;
+	1.5)	scale=1; xft_dpi=144 ;;
+	2)	scale=2; xft_dpi=96  ;;
+	*)	dpi_warn "ignoring invalid override '$1'"
+		return 1 ;;
+	esac
+	reason="user override '$1'"
+	return 0
+}
+
+cursor_size()
+{
+	if [ "${scale}" -eq 2 ]; then
+		echo ${cursor_2x}
+	else
+		echo ${cursor_1x}
+	fi
+}
+
+write_env_file()
+{
+	mkdir -p "${path_state_dir}"
+	# GDK_SCALE drives GTK3 integer window scaling via environment,
+	# bypassing xfconf/xfconfd entirely.  This avoids the reactive
+	# XSETTINGS notification that xfsettingsd previously sent when it
+	# picked up a changed WindowScalingFactor mid-session-startup,
+	# which caused the compositor and window manager to reinitialize
+	# and produced visible screen blanks (apparent X restarts).
+	# GDK_DPI_SCALE=1 prevents GTK from additionally scaling fonts on
+	# top of the window scale (which would double-scale them).
+	if [ "${scale}" -ge 2 ]; then
+		gdk_scale=${scale}
+		gdk_dpi_scale=1
+	else
+		gdk_scale=1
+		gdk_dpi_scale=1
+	fi
+	cat > "${path_env}" << ENV_EOF
+# Generated by nomadbsd-dpi - do not edit; use "nomadbsd-dpi set" instead.
+# ${reason}
+export NOMADBSD_DPI_SCALE=${scale}
+export NOMADBSD_XFT_DPI=${xft_dpi}
+export GDK_SCALE=${gdk_scale}
+export GDK_DPI_SCALE=${gdk_dpi_scale}
+export QT_AUTO_SCREEN_SCALE_FACTOR=0
+export QT_ENABLE_HIGHDPI_SCALING=0
+export QT_SCALE_FACTOR=${scale}
+export QT_FONT_DPI=${xft_dpi}
+export XCURSOR_SIZE=$(cursor_size)
+ENV_EOF
+}
+
+print_env()
+{
+	if [ "${scale}" -ge 2 ]; then
+		gdk_scale=${scale}; gdk_dpi_scale=1
+	else
+		gdk_scale=1; gdk_dpi_scale=1
+	fi
+	echo "export NOMADBSD_DPI_SCALE=${scale}"
+	echo "export NOMADBSD_XFT_DPI=${xft_dpi}"
+	echo "export GDK_SCALE=${gdk_scale}"
+	echo "export GDK_DPI_SCALE=${gdk_dpi_scale}"
+	echo "export QT_AUTO_SCREEN_SCALE_FACTOR=0"
+	echo "export QT_ENABLE_HIGHDPI_SCALING=0"
+	echo "export QT_SCALE_FACTOR=${scale}"
+	echo "export QT_FONT_DPI=${xft_dpi}"
+	echo "export XCURSOR_SIZE=$(cursor_size)"
+}
+
+#
+# Write cursor size into the xfconf XSETTINGS XML so xfsettingsd reads the
+# correct value cold on session startup — no xfconfd is started before the
+# session, and no reactive XSETTINGS notification is issued.
+#
+# GTK window scaling (WindowScalingFactor) is now handled by GDK_SCALE in
+# the environment (written by write_env_file above).  Xft/DPI is handled
+# by apply_xrdb (X resources), read by apps at connect time with no
+# notification to already-running processes.  Together these eliminate
+# the mid-session reactive changes that caused the compositor and window
+# manager to reinitialize (the visible screen blanks that looked like X
+# restarting multiple times).
+#
+# Only CursorThemeSize is written here because cursor size has no
+# standard environment variable.  All other xfsettingsd-managed settings
+# (theme, font, icon theme, etc.) are preserved exactly as-is.
+#
+apply_xfconf_xml()
+{
+	local xfconf_dir="${HOME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+	local xset="${xfconf_dir}/xsettings.xml"
+	local csize; csize=$(cursor_size)
+
+	mkdir -p "${xfconf_dir}"
+
+	# Use Python's ElementTree to update only CursorThemeSize, preserving
+	# every other property the user or Xfce has set in xsettings.xml.
+	python3 << PYEOF 2>/dev/null || true
+import sys, os
+from xml.etree import ElementTree as ET
+
+path  = '${xset}'
+csize = ${csize}
+
+if os.path.exists(path):
+    ET.register_namespace('', '')
+    tree = ET.parse(path)
+    root = tree.getroot()
+else:
+    root = ET.fromstring(
+        '<channel name="xsettings" version="1.0"></channel>')
+    tree = ET.ElementTree(root)
+
+def upsert(parent, name, **attrs):
+    for child in parent:
+        if child.get('name') == name:
+            for k, v in attrs.items():
+                child.set(k, v)
+            return child
+    return ET.SubElement(parent, 'property', name=name, **attrs)
+
+gtk = upsert(root, 'Gtk', type='empty')
+upsert(gtk, 'CursorThemeSize', type='int', value=str(csize))
+tree.write(path, encoding='UTF-8', xml_declaration=True)
+PYEOF
+}
+
+
+apply_xrdb()
+{
+	command -v xrdb > /dev/null 2>&1 || return 0
+	if [ "${scale}" -eq 2 ]; then
+		echo "Xft.dpi: 192" | xrdb -merge
+	else
+		echo "Xft.dpi: ${xft_dpi}" | xrdb -merge
+	fi
+}
+
+#
+# The state machine used at session start:
+#  - boot menu toggle set          -> do nothing at all
+#  - fingerprint unchanged + saved -> reuse (cheap, and never fights a
+#                                     choice the user made in Xfce's own
+#                                     settings dialog)
+#  - fingerprint changed/missing   -> detect, honor override, save
+#
+do_apply()
+{
+	if [ "$(kenv -q ${kenv_disable} 2> /dev/null)" = "1" ]; then
+		dpi_warn "detection disabled via boot menu"
+		rm -f "${path_env}"
+		return 0
+	fi
+	if ! have_display; then
+		dpi_warn "no usable X display; nothing to do"
+		return 0
+	fi
+
+	curr_fp=$(calc_fingerprint)
+	prev_fp=""
+	[ -f "${path_fingerprint}" ] && prev_fp=$(cat "${path_fingerprint}")
+
+	if [ "${curr_fp}" = "${prev_fp}" ] && [ -f "${path_env}" ]; then
+		# Known hardware, decision already on file. Re-run only the
+		# volatile side (xrdb dies with the X server).
+		. "${path_env}"
+		scale=${NOMADBSD_DPI_SCALE:-1}
+		xft_dpi=${NOMADBSD_XFT_DPI:-96}
+		reason="saved decision for unchanged display set"
+		apply_xrdb
+		return 0
+	fi
+
+	detect
+	override="auto"
+	[ -f "${path_override}" ] && override=$(cat "${path_override}")
+	apply_override "${override}" || :
+
+	write_env_file
+	apply_xfconf_xml
+	apply_xrdb
+	mkdir -p "${path_state_dir}"
+	echo "${curr_fp}" > "${path_fingerprint}"
+	dpi_warn "${reason}"
+}
+
+do_status()
+{
+	override="auto"
+	[ -f "${path_override}" ] && override=$(cat "${path_override}")
+	echo "override:    ${override}"
+	if [ -f "${path_env}" ]; then
+		echo "env file:    ${path_env}"
+		grep '^#' "${path_env}" | tail -1 | sed 's/^# /decision:    /'
+	else
+		echo "env file:    (none)"
+	fi
+	if have_display; then
+		detect || :
+		echo "detection:   ${reason}"
+	else
+		echo "detection:   (no X display)"
+	fi
+}
+
+case "$1" in
+detect)
+	if ! have_display; then
+		dpi_warn "DISPLAY not set or xrandr unavailable"
+		exit 1
+	fi
+	detect || :
+	echo "output=${out_name} dpi=${dpi} edid_ok=${edid_ok}" \
+	     "scale=${scale} xft_dpi=${xft_dpi}"
+	echo "reason: ${reason}"
+	;;
+env)
+	if have_display; then
+		detect || :
+		override="auto"
+		[ -f "${path_override}" ] && override=$(cat "${path_override}")
+		apply_override "${override}" || :
+	fi
+	print_env
+	;;
+apply)
+	do_apply
+	;;
+set)
+	case "$2" in
+	auto|off|1|1.5|2)
+		mkdir -p "${path_state_dir}"
+		echo "$2" > "${path_override}"
+		# Force re-evaluation on next apply.
+		rm -f "${path_fingerprint}"
+		echo "Override set to '$2'. Run" \
+		     "\"$(basename $0) apply\" or re-login to take effect."
+		;;
+	*)
+		echo "usage: $(basename $0) set <auto|off|1|1.5|2>" >&2
+		exit 1
+		;;
+	esac
+	;;
+status)
+	do_status
+	;;
+*)
+	echo "usage: $(basename $0) <detect|env|apply|set|status>" >&2
+	exit 1
+	;;
+esac

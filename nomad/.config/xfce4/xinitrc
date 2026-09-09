@@ -23,5 +23,12 @@ fi
 
 create_cache_dir
 
+# HiDPI: detect display DPI and apply UI scaling before the session
+# (and thus every GTK/Qt process) starts. See nomadbsd-dpi(8)/handbook.
+if [ -x /usr/libexec/nomadbsd-dpi ]; then
+  /usr/libexec/nomadbsd-dpi apply
+  [ -f ~/.config/nomadbsd/hidpi.env ] && . ~/.config/nomadbsd/hidpi.env
+fi
+
 . /usr/local/etc/xdg/xfce4/xinitrc
 

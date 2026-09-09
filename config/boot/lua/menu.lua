@@ -221,6 +221,17 @@ menu.boot_options = {
 			func = core.disableGfxDetect,
 			alias = {"g", "G"},
 		},
+		-- disable automatic display-DPI/HiDPI detection
+		{
+			entry_type = core.MENU_ENTRY,
+			name = function()
+				return OnOff("Disable automatic D" ..
+				    color.highlight("P") .. "I detec" ..
+				    "tion: ", core.disable_dpidetect)
+			end,
+			func = core.disableDpiDetect,
+			alias = {"p", "P"},
+		},
 		-- verbose boot
 		{
 			entry_type = core.MENU_ENTRY,

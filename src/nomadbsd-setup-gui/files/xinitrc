@@ -4,6 +4,11 @@ export LC_ALL=en_US.UTF-8
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export QT_QPA_PLATFORMTHEME=qt5ct
 export QT_FONT_DPI=96
+# HiDPI: on 4K/HiDPI panels scale the setup wizard, or the very first
+# thing a user sees is unreadable. Overrides QT_FONT_DPI when needed.
+if [ -x /usr/libexec/nomadbsd-dpi ]; then
+	eval $(/usr/libexec/nomadbsd-dpi env)
+fi
 export GTK2_RC_FILES="/usr/share/nomadbsd-setup/gtkrc-2.0"
 wallpaper="/usr/share/nomadbsd-setup/background.jpg"
 xrdb /usr/share/nomadbsd-setup/Xresources
