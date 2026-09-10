@@ -8,6 +8,14 @@ sleep_secs=3
 host_name="google.com"
 log_file="/var/log/fetch-fw.log"
 
+# Re-solicit an IPv6 Router Advertisement now that IPv4 is confirmed
+# working (ADDR_ADD means dhclient succeeded, so the link is stable).
+# rtsol sends a single Router Solicitation which prompts the router to
+# respond with an RA immediately, rather than waiting for its next
+# periodic unsolicited RA (which can be several minutes away). Run it
+# in the background so it does not delay the firmware fetch.
+[ -n "$1" ] && rtsol "$1" 2>/dev/null &
+
 host -R ${max_tries} -W ${sleep_secs} ${host_name} >/dev/null 2>&1
 [ $? -ne 0 ] && exit 1
 for i in 1 2 3; do
@@ -15,4 +23,3 @@ for i in 1 2 3; do
   (/usr/sbin/fwget >> ${log_file} 2>&1) && exit 0
   sleep 3
 done
-
